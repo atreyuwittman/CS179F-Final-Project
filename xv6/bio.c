@@ -26,14 +26,53 @@
 #include "fs.h"
 #include "buf.h"
 
+#define BUFSIZE NBUF + SEGBLOCKS
+
 struct {
   struct spinlock lock;
-  struct buf buf[NBUF];
+  struct buf buf[BUFSIZE];
 
   // Linked list of all buffers, through prev/next.
   // head.next is most recently used.
   struct buf head;
 } bcache;
+
+struct {
+  uchar busy; // is writing?
+  struct spinlock lock;
+  uint start; // where seg will be written
+  uint count; // number of blocks already copied into data
+  struct buf *blocks[SEGDATABLOCKS];
+} seg;
+
+static void waitseg(void)
+{
+  if (seg.busy != 1)
+    return;
+  acquire(&seg.lock);
+  while (seg.busy == 1)
+    sleep(&seg, &seg.lock);
+  release(&seg.lock);
+}
+
+// Return a new, locked buf without an assigned block
+struct buf*
+balloc(uint dev)
+{
+  waitseg();
+  struct buf *b;
+  acquire(&bcache.lock);
+  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+    if((b->flags & B_BUSY) == 0 && (b->flags & B_DIRTY) == 0){
+      b->dev = dev;
+      b->blockno = 0;
+      b->flags = B_BUSY;
+      release(&bcache.lock);
+      return b;
+    }
+  }
+  panic("balloc: no free buffers");
+}
 
 void
 binit(void)
@@ -41,6 +80,7 @@ binit(void)
   struct buf *b;
 
   initlock(&bcache.lock, "bcache");
+  initlock(&seg.lock, "seg");
 
 //PAGEBREAK!
   // Create linked list of buffers
@@ -49,10 +89,15 @@ binit(void)
   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
     b->next = bcache.head.next;
     b->prev = &bcache.head;
+	b->dev = -1;
+	b->flags = 0;
     initsleeplock(&b->lock, "buffer");
     bcache.head.next->prev = b;
     bcache.head.next = b;
   }
+  
+  seg.start = seg.count = 0;
+  memset(seg.blocks, 0, sizeof(seg.blocks));
 }
 
 // Look through buffer cache for block on device dev.
@@ -61,41 +106,44 @@ binit(void)
 static struct buf*
 bget(uint dev, uint blockno)
 {
+	if (blockno == 0) panic("bget: invalid block");
+	
+	waitseg();
+	
   struct buf *b;
 
   acquire(&bcache.lock);
 
+  loop:
   // Is the block already cached?
   for(b = bcache.head.next; b != &bcache.head; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
-      b->refcnt++;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
+      if (!(b->flags & B_BUSY)){
+		  b->flags |= B_BUSY;
+		  release(&bcache.lock);
+		  acquiresleep(&b->lock);
+		  return b;
+	  }
+	  
+	  sleep(b, &bcache.lock);
+	  goto loop;
     }
   }
-
-  // Not cached; recycle an unused buffer.
-  // Even if refcnt==0, B_DIRTY indicates a buffer is in use
-  // because log.c has modified it but not yet committed it.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0 && (b->flags & B_DIRTY) == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->flags = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
-  }
-  panic("bget: no buffers");
+  
+  release(&bcache.lock);
+  if (seg.start !=0 && blockno > seg.start && blockno < seg.start + SEGBLOCKS)
+    panic("bget: block in new seg range.");
+  
+  b = balloc(dev);
+  b->blockno = blockno;
+  return b;
 }
 
 // Return a locked buf with the contents of the indicated block.
 struct buf*
 bread(uint dev, uint blockno)
 {
+	waitseg();
   struct buf *b;
 
   b = bget(dev, blockno);
@@ -106,13 +154,71 @@ bread(uint dev, uint blockno)
 }
 
 // Write b's contents to disk.  Must be locked.
-void
+uint
 bwrite(struct buf *b)
 {
-  if(!holdingsleep(&b->lock))
-    panic("bwrite");
+  if ((b->flags & B_BUSY) == 0)
+      panic("bwrite");
+
+  // superblock writing.
+  if (b->blockno == 1) {
+    b->flags |= B_DIRTY;
+    iderw(b);
+	return 0;
+  }
+
+  waitseg();
+  acquire(&seg.lock);
+  struct superblock *sb = readsb();
+
+  // initialize new seg
+  if (seg.start == 0)
+    seg.start = sb->next;
+
+  if ((b->flags & B_DIRTY) != 0 || (b->blockno > seg.start && b->blockno < seg.start + SEGBLOCKS)) {
+    release(&seg.lock);
+    return b->blockno;
+  }
+
+  seg.blocks[seg.count] = b;
+  b->blockno = seg.start + SEGMETABLOCKS + seg.count++;
   b->flags |= B_DIRTY;
-  iderw(b);
+
+  if (seg.count == SEGDATABLOCKS) {
+    cprintf("bio: Writing segment.\n");
+    seg.busy = 1;
+    release(&seg.lock);
+
+    // write zeroes for block metadata for now    
+    uint k;
+    struct buf meta;
+    memset(meta.data, 0, sizeof(meta.data));
+    meta.dev = ROOTDEV;
+    for (k = 0; k < SEGMETABLOCKS; k++) {
+      meta.flags = B_DIRTY | B_BUSY;
+      meta.blockno = seg.start + k;
+      iderw(&meta);
+    }
+
+    for (k = 0; k < SEGDATABLOCKS; k++) {
+      int prevflags = seg.blocks[k]->flags;
+      seg.blocks[k]->flags = B_DIRTY | B_BUSY;
+      iderw(seg.blocks[k]);
+      seg.blocks[k]->flags = prevflags & (~B_DIRTY);
+    }
+    
+    sb->segment = seg.start;
+    sb->next += SEGBLOCKS;
+    sb->nsegs++;
+    sb->nblocks += SEGBLOCKS;
+
+    memset(seg.blocks, 0, sizeof(seg.blocks));
+    seg.count = seg.start = seg.busy = 0;
+    wakeup(&seg);
+  } else
+    release(&seg.lock);
+
+  return b->blockno;
 }
 
 // Release a locked buffer.
@@ -125,6 +231,7 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
+  waitseg();
   acquire(&bcache.lock);
   b->refcnt--;
   if (b->refcnt == 0) {
@@ -135,6 +242,9 @@ brelse(struct buf *b)
     b->prev = &bcache.head;
     bcache.head.next->prev = b;
     bcache.head.next = b;
+	
+	b->flags &= ~B_BUSY;
+	wakeup(b);
   }
   
   release(&bcache.lock);

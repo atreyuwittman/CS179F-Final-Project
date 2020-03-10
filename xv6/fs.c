@@ -28,14 +28,29 @@ static void itrunc(struct inode*);
 struct superblock sb; 
 
 // Read the super block.
-void
-readsb(int dev, struct superblock *sb)
+struct superblock *
+readsb(void)
 {
-  struct buf *bp;
+	static struct superblock _sb;
 
-  bp = bread(dev, 1);
-  memmove(sb, bp->data, sizeof(*sb));
-  brelse(bp);
+	if (_sb.nblocks == 0) {
+		struct buf *bp;
+		bp = bread(ROOTDEV, 1);
+		memmove(&_sb, bp->data, sizeof(_sb));
+		brelse(bp);
+	}
+	return &_sb;
+}
+
+void
+flushsb(void)
+{
+	struct superblock *sb = readsb();
+	struct buf *bp;
+	bp = bread(ROOTDEV, 1);
+	memmove(bp -> data, sb, sizeof(*sb));
+	bwrite(bp);
+	brelse(bp);
 }
 
 // Zero a block.
@@ -52,46 +67,11 @@ bzero(int dev, int bno)
 
 // Blocks.
 
-// Allocate a zeroed disk block.
-static uint
-balloc(uint dev)
-{
-  int b, bi, m;
-  struct buf *bp;
-
-  bp = 0;
-  for(b = 0; b < sb.size; b += BPB){
-    bp = bread(dev, BBLOCK(b, sb));
-    for(bi = 0; bi < BPB && b + bi < sb.size; bi++){
-      m = 1 << (bi % 8);
-      if((bp->data[bi/8] & m) == 0){  // Is block free?
-        bp->data[bi/8] |= m;  // Mark block in use.
-        log_write(bp);
-        brelse(bp);
-        bzero(dev, b + bi);
-        return b + bi;
-      }
-    }
-    brelse(bp);
-  }
-  panic("balloc: out of blocks");
-}
-
 // Free a disk block.
 static void
 bfree(int dev, uint b)
 {
-  struct buf *bp;
-  int bi, m;
-
-  bp = bread(dev, BBLOCK(b, sb));
-  bi = b % BPB;
-  m = 1 << (bi % 8);
-  if((bp->data[bi/8] & m) == 0)
-    panic("freeing free block");
-  bp->data[bi/8] &= ~m;
-  log_write(bp);
-  brelse(bp);
+	//TODO
 }
 
 // Inodes.
@@ -171,18 +151,42 @@ struct {
 void
 iinit(int dev)
 {
-  int i = 0;
-  
   initlock(&icache.lock, "icache");
-  for(i = 0; i < NINODE; i++) {
-    initsleeplock(&icache.inode[i].lock, "inode");
-  }
+}
 
-  readsb(dev, &sb);
-  cprintf("sb: size %d nblocks %d ninodes %d nlog %d logstart %d\
- inodestart %d bmap start %d\n", sb.size, sb.nblocks,
-          sb.ninodes, sb.nlog, sb.logstart, sb.inodestart,
-          sb.bmapstart);
+uint imapalloc(void)
+{
+	return readsb()->ninodes++;
+}
+
+void imapset(uint dev, uint inum, uint new)
+{
+	struct buf *bp = bread(dev, readsb()->imap);
+	uint *imap = (uint*)bp->data;
+	if (inum >= MAX_INODES)
+	{
+		panic("imapset");
+	}
+	
+	imap[inum] = new;
+	readsb()->imap = bwrite(bp);
+	brelse(bp);
+}
+
+void imapget(uint dev, uint inum, struct dinode *out)
+{
+	struct buf *bp = bread(dev, readsb()->imap);
+	uint b = *((uint *)bp->data + inum);
+	brelse(bp);
+	
+	if (b == 0)
+	{
+		panic("imapget: no imap number");
+	}
+	
+	bp = bread(dev, b);
+	memmove(out, bp->data, sizeof(*out));
+	brelse(bp);
 }
 
 static struct inode* iget(uint dev, uint inum);
@@ -194,23 +198,14 @@ static struct inode* iget(uint dev, uint inum);
 struct inode*
 ialloc(uint dev, short type)
 {
-  int inum;
-  struct buf *bp;
-  struct dinode *dip;
+	struct buf *bp = balloc(dev);
+	struct dinode *dip = (struct dinode *)(bp->data);
+	dip->type = type;
 
-  for(inum = 1; inum < sb.ninodes; inum++){
-    bp = bread(dev, IBLOCK(inum, sb));
-    dip = (struct dinode*)bp->data + inum%IPB;
-    if(dip->type == 0){  // a free inode
-      memset(dip, 0, sizeof(*dip));
-      dip->type = type;
-      log_write(bp);   // mark it allocated on the disk
-      brelse(bp);
-      return iget(dev, inum);
-    }
-    brelse(bp);
-  }
-  panic("ialloc: no inodes");
+	uint inum = imapalloc();
+	imapset(dev, inum, bwrite(bp));
+	brelse(bp);
+	return iget(dev, inum);
 }
 
 // Copy a modified in-memory inode to disk.
@@ -220,19 +215,22 @@ ialloc(uint dev, short type)
 void
 iupdate(struct inode *ip)
 {
-  struct buf *bp;
-  struct dinode *dip;
+	struct dinode *dip;
+	struct buf *imap_bp = bread(ip->dev, readsb()->imap);
+	uint b = *((uint *)imap_bp->data + ip->inum);
+	brelse(imap_bp);
+	
+	struct buf *bp = bread(ip->dev, b);
 
-  bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-  dip = (struct dinode*)bp->data + ip->inum%IPB;
-  dip->type = ip->type;
-  dip->major = ip->major;
-  dip->minor = ip->minor;
-  dip->nlink = ip->nlink;
-  dip->size = ip->size;
-  memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
-  log_write(bp);
-  brelse(bp);
+	dip->type = ip->type;
+	dip->major = ip->major;
+	dip->minor = ip->minor;
+	dip->nlink = ip->nlink;
+	dip->size = ip->size;
+	memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
+	memmove(bp->data, &dip, sizeof(dip));
+	imapset(ip->dev, ip->inum, bwrite(bp));
+	brelse(bp);
 }
 
 // Find the inode with number inum on device dev
@@ -296,8 +294,7 @@ ilock(struct inode *ip)
   acquiresleep(&ip->lock);
 
   if(ip->valid == 0){
-    bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-    dip = (struct dinode*)bp->data + ip->inum%IPB;
+    imapget(ip->dev, ip->inum, &dip);
     ip->type = dip->type;
     ip->major = dip->major;
     ip->minor = dip->minor;
@@ -377,7 +374,9 @@ bmap(struct inode *ip, uint bn)
 
   if(bn < NDIRECT){
     if((addr = ip->addrs[bn]) == 0)
-      ip->addrs[bn] = addr = balloc(ip->dev);
+	{
+		panic("bmap");
+	}
     return addr;
   }
   bn -= NDIRECT;
@@ -385,12 +384,13 @@ bmap(struct inode *ip, uint bn)
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
     if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+    {
+		panic("bmap");
+	}
     bp = bread(ip->dev, addr);
     a = (uint*)bp->data;
     if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev);
-      log_write(bp);
+		panic("bmap");
     }
     brelse(bp);
     return addr;
@@ -407,6 +407,7 @@ bmap(struct inode *ip, uint bn)
 static void
 itrunc(struct inode *ip)
 {
+  panic("itrunc");
   int i, j;
   struct buf *bp;
   uint *a;

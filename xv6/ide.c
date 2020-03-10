@@ -74,19 +74,13 @@ static void
 idestart(struct buf *b)
 {
   if(b == 0)
-    panic("idestart");
-  if(b->blockno >= FSSIZE)
-    panic("incorrect blockno");
-  int sector_per_block =  BSIZE/SECTOR_SIZE;
-  int sector = b->blockno * sector_per_block;
-  int read_cmd = (sector_per_block == 1) ? IDE_CMD_READ :  IDE_CMD_RDMUL;
-  int write_cmd = (sector_per_block == 1) ? IDE_CMD_WRITE : IDE_CMD_WRMUL;
+	panic("idestart");
 
-  if (sector_per_block > 7) panic("idestart");
+  uint sector = B2S(b->block);
 
   idewait(0);
   outb(0x3f6, 0);  // generate interrupt
-  outb(0x1f2, sector_per_block);  // number of sectors
+  outb(0x1f2, SPB);  // number of sectors
   outb(0x1f3, sector & 0xff);
   outb(0x1f4, (sector >> 8) & 0xff);
   outb(0x1f5, (sector >> 16) & 0xff);

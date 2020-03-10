@@ -9,7 +9,6 @@ OBJS = \
 	kalloc.o\
 	kbd.o\
 	lapic.o\
-	log.o\
 	main.o\
 	mp.o\
 	picirq.o\
@@ -172,6 +171,7 @@ UPROGS=\
 	_grep\
 	_init\
 	_kill\
+	_lab3\
 	_ln\
 	_ls\
 	_mkdir\
