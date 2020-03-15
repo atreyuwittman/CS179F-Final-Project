@@ -53,18 +53,6 @@ flushsb(void)
 	brelse(bp);
 }
 
-// Zero a block.
-static void
-bzero(int dev, int bno)
-{
-  struct buf *bp;
-
-  bp = bread(dev, bno);
-  memset(bp->data, 0, BSIZE);
-  log_write(bp);
-  brelse(bp);
-}
-
 // Blocks.
 
 // Free a disk block.
@@ -285,8 +273,7 @@ idup(struct inode *ip)
 void
 ilock(struct inode *ip)
 {
-  struct buf *bp;
-  struct dinode *dip;
+  struct dinode dip;
 
   if(ip == 0 || ip->ref < 1)
     panic("ilock");
@@ -295,13 +282,12 @@ ilock(struct inode *ip)
 
   if(ip->valid == 0){
     imapget(ip->dev, ip->inum, &dip);
-    ip->type = dip->type;
-    ip->major = dip->major;
-    ip->minor = dip->minor;
-    ip->nlink = dip->nlink;
-    ip->size = dip->size;
-    memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
-    brelse(bp);
+    ip->type = dip.type;
+    ip->major = dip.major;
+    ip->minor = dip.minor;
+    ip->nlink = dip.nlink;
+    ip->size = dip.size;
+    memmove(ip->addrs, dip.addrs, sizeof(ip->addrs));
     ip->valid = 1;
     if(ip->type == 0)
       panic("ilock: no type");

@@ -76,7 +76,7 @@ idestart(struct buf *b)
   if(b == 0)
 	panic("idestart");
 
-  uint sector = B2S(b->block);
+  uint sector = B2S(b->blockno);
 
   idewait(0);
   outb(0x3f6, 0);  // generate interrupt
@@ -86,10 +86,10 @@ idestart(struct buf *b)
   outb(0x1f5, (sector >> 16) & 0xff);
   outb(0x1f6, 0xe0 | ((b->dev&1)<<4) | ((sector>>24)&0x0f));
   if(b->flags & B_DIRTY){
-    outb(0x1f7, write_cmd);
+    outb(0x1f7, IDE_CMD_WRITE);
     outsl(0x1f0, b->data, BSIZE/4);
   } else {
-    outb(0x1f7, read_cmd);
+    outb(0x1f7, IDE_CMD_READ);
   }
 }
 
