@@ -278,9 +278,13 @@ ilock(struct inode *ip)
   if(ip == 0 || ip->ref < 1)
     panic("ilock");
 
-  acquiresleep(&ip->lock);
+  acquire(&icache.lock);
+  while(ip->flags & I_BUSY)
+    sleep(ip, &icache.lock);
+  ip->flags |= I_BUSY;
+  release(&icache.lock);
 
-  if(ip->valid == 0){
+  if(!(ip->flags & I_VALID)){
     imapget(ip->dev, ip->inum, &dip);
     ip->type = dip.type;
     ip->major = dip.major;

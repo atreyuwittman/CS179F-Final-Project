@@ -1,127 +1,71 @@
+
+/*
+  mkfs for a log-structured filesystem
+  see README.
+*/
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <assert.h>
+#include <sys/param.h> // for min/max
+#include <stdint.h>
 
-#define stat xv6_stat  // avoid clash with host struct stat
 #include "types.h"
 #include "fs.h"
+#define stat xv6_stat  // avoid clash with host struct stat
 #include "stat.h"
-#include "param.h"
 
-#ifndef static_//assert
-#define static_//assert(a, b) do { switch (0) case 0: case (a): ; } while (0)
-#endif
-
-#define NINODES 200
-
-// Disk layout:
-// [ boot block | sb block | log | inode blocks | free bit map | data blocks ]
-
-int nbitmap = FSSIZE/(BSIZE*8) + 1;
-int ninodeblocks = NINODES / IPB + 1;
-int nlog = LOGSIZE;
-int nmeta;    // Number of meta blocks (boot, sb, nlog, inode, bitmap)
-int nblocks;  // Number of data blocks
-
-int fsfd;
+// global variables
+int fsd;
 struct superblock sb;
+
 uint imap[MAX_INODES];
-static uint cur_block = 1 + SEGMETABLOCKS;
-static uint cur_inode = 1;
+static uint cur_block = 1 + SEGMETABLOCKS; // 0 for superblock
+static uint cur_inode = 1; // inode 0 means null
 static uint seg_block = 0;
 
-char zeroes[BSIZE];
-uint freeinode = 1;
-uint freeblock;
-
-
+// block funcs
 uint balloc(void);
-void bwrite(uint addr, const void *data);
-uint data_block(uint *addrs, uint off);
-void seg_finish(uint start);
+void bwrite(uint, const void *);
+uint data_block(uint *, uint);
+void seg_finish(uint);
 
-void winode(uint, struct dinode*);
-void rinode(uint inum, struct dinode *ip);
-void rsect(uint sec, void *buf);
-uint ialloc(ushort type);
-void iappend(uint inum, void *p, int n);
+// inode funcs
+uint ialloc(short);
+void iread(uint, struct dinode *);
+void iwrite(uint, struct dinode *);
+void iappend(uint, void *, uint);
 
-#define FLOC(a) (B2S(a) * 512)
-#define min(a, b) ((a) < (b) ? (a) : (b))
-
-// convert to intel byte order
-ushort
-xshort(ushort x)
+int main(int argc, char * argv[])
 {
-  ushort y;
-  uchar *a = (uchar*)&y;
-  a[0] = x;
-  a[1] = x >> 8;
-  return y;
-}
-
-uint
-xint(uint x)
-{
-  uint y;
-  uchar *a = (uchar*)&y;
-  a[0] = x;
-  a[1] = x >> 8;
-  a[2] = x >> 16;
-  a[3] = x >> 24;
-  return y;
-}
-
-void bread(uint addr, void *buf)
-{
-	//assert(lseek(fsfd, FLOC(addr), SEEK_SET) == FLOC(addr));
-	//assert(read(fsfd, buf, BSIZE) == BSIZE);
-}
-
-void bwrite(uint addr, const void *data)
-{
-	//assert(lseek(fsfd, FLOC(addr), SEEK_SET) == FLOC(addr));
-	//assert(write(fsfd, data, BSIZE)  == BSIZE);
-}
-
-int
-main(int argc, char *argv[])
-{
-	struct dirent de;
-	char buf[BSIZE];
-
 	bzero(&sb, sizeof(sb));
 	sb.nsegs = 0;
 	sb.segment = 0;
 
-	static_//assert(sizeof(int) == 4, "Integers must be 4 bytes!");
-
-	if(argc < 2){
-		fprintf(stderr, "Usage: mkfs fs.img files...\n");
+	if (argc < 2) {
+		printf("Usage: mkfs [image file] [input files...]\n");
 		exit(1);
 	}
 
-	////assert((BSIZE % sizeof(struct dinode)) == 0);
-	////assert((BSIZE % sizeof(struct dirent)) == 0);
-
-	fsfd = open(argv[1], O_RDWR|O_CREAT|O_TRUNC, 0666);
-	if(fsfd < 0){
+	fsd = open(argv[1], O_RDWR|O_CREAT|O_TRUNC, 0666);
+	if (fsd < 0) {
 		perror(argv[1]);
 		exit(1);
 	}
-
+	
 	uint rootino = ialloc(T_DIR);
+	struct dirent de;
 
 	bzero(&de, sizeof(de));
-	de.inum = xshort(rootino);
+	de.inum = rootino;
 	strcpy(de.name, ".");
 	iappend(rootino, &de, sizeof(de));
-  
-  	bzero(&de, sizeof(de));
-	de.inum = xshort(rootino);
+
+	bzero(&de, sizeof(de));
+	de.inum = rootino;
 	strcpy(de.name, "..");
 	iappend(rootino, &de, sizeof(de));
 
@@ -140,9 +84,9 @@ main(int argc, char *argv[])
 		uint inum = ialloc(T_FILE);
 
 		bzero(&de, sizeof(de));
-		de.inum = xshort(inum);
+		de.inum = inum;
 		strncpy(de.name, argv[i], DIRSIZ);
-		iappend(xshort(rootino), &de, sizeof(de));
+		iappend(rootino, &de, sizeof(de));
 
 		char bf[BSIZE];
 		int cc;
@@ -155,12 +99,13 @@ main(int argc, char *argv[])
 	uint imap_block = balloc();
 	bwrite(imap_block, imap);
 	
+	char buf[BSIZE];
 	bzero(buf, BSIZE);
 
-	sb.imap = xint(imap_block);
-	sb.nblocks = xint(cur_block);
-	sb.ninodes = xint(cur_inode);
-	sb.next = xint(cur_block);
+	sb.imap = imap_block;
+	sb.nblocks = cur_block;
+	sb.ninodes = cur_inode;
+	sb.next = cur_block;
 
 	memcpy(buf, &sb, sizeof(sb));
 	bwrite(1, buf);
@@ -174,7 +119,7 @@ main(int argc, char *argv[])
 	for (k = 0; k < SEGBLOCKS * 20 + 50; k++)
 		bwrite(cur_block + k, buf);
 
-	close(fsfd);
+	close(fsd);
 
 	return 0;
 }
@@ -189,38 +134,84 @@ void seg_finish(uint start)
 		bwrite(start + k, zeroes);
 }
 
-void
-wsect(uint sec, void *buf)
+uint balloc(void)
 {
-  if(lseek(fsfd, sec * BSIZE, 0) != sec * BSIZE){
-    perror("lseek");
-    exit(1);
-  }
-  if(write(fsfd, buf, BSIZE) != BSIZE){
-    perror("write");
-    exit(1);
-  }
+	char zeroes[BSIZE];
+	bzero(zeroes, BSIZE);
+
+	uint bret = cur_block++;
+	bwrite(bret, zeroes);
+
+	// segment is full.
+	if (++seg_block == SEGDATABLOCKS) {
+		seg_block = 0;
+		sb.segment = cur_block - SEGDATABLOCKS;
+		sb.nsegs++;
+
+		seg_finish(sb.segment);
+
+		cur_block += SEGMETABLOCKS;
+	}
+
+	return bret;
 }
 
-void
-winode(uint inum, struct dinode *ip)
+// 0-512 is boot sector
+#define FLOC(a) (B2S(a) * 512)
+
+void bread(uint addr, void * buf)
 {
-  char buf[BSIZE];
-  bzero(buf, BSIZE);
-  memcpy(buf, ip, sizeof(struct dinode));
-  bwrite(imap[inum], buf);
+	assert(lseek(fsd, FLOC(addr), SEEK_SET) == FLOC(addr));
+	assert(read(fsd, buf, BSIZE) == BSIZE);
 }
 
-void
-rinode(uint inum, struct dinode *ip)
+void bwrite(uint addr, const void * data)
 {
-  char buf[BSIZE];
-  bzero(buf, BSIZE);
-  memcpy(buf, ip, sizeof(struct dinode));
-  bwrite(imap[inum], buf);
+	assert(lseek(fsd, FLOC(addr), SEEK_SET) == FLOC(addr));
+	assert(write(fsd, data, BSIZE)  == BSIZE);
 }
 
-uint data_block(uint *addrs, uint off)
+uint ialloc(short type)
+{
+	if (cur_inode >= MAX_INODES) {
+		printf("Error: inode limit exceeded.\n");
+		exit(1);
+	}
+	struct dinode ip;
+	bzero(&ip, sizeof(ip));
+
+	ip.type = type;
+	ip.nlink = 1;
+	ip.size = 0;
+
+	uint nb = balloc();
+	char buf[BSIZE];
+	bzero(buf, BSIZE);
+
+	memcpy(buf, &ip, sizeof(ip));
+	bwrite(nb, buf);
+	imap[cur_inode] = nb;
+
+	return cur_inode++;
+}
+
+void iwrite(uint i, struct dinode * di)
+{
+	char buf[BSIZE];
+	bzero(buf, BSIZE);
+	memcpy(buf, di, sizeof(struct dinode));
+	bwrite(imap[i], buf);
+}
+
+void iread(uint i, struct dinode * di)
+{
+	char buf[BSIZE];
+	bzero(buf, BSIZE);
+	bread(imap[i], buf);
+	memcpy(di, buf, sizeof(struct dinode));
+}
+
+uint data_block(uint * addrs, uint off)
 {
 	const uint bn = off / BSIZE;
 	uint cnt = 0, level = 0;
@@ -261,93 +252,31 @@ uint data_block(uint *addrs, uint off)
 	return bnext;
 }
 
-void
-rsect(uint sec, void *buf)
-{
-  if(lseek(fsfd, sec * BSIZE, 0) != sec * BSIZE){
-    perror("lseek");
-    exit(1);
-  }
-  if(read(fsfd, buf, BSIZE) != BSIZE){
-    perror("read");
-    exit(1);
-  }
-}
 
-uint
-ialloc(ushort type)
-{
-	if (cur_inode >= MAX_INODES)
-	{
-		printf("Error: inode limit exceeded.\n");
-		exit(1);
-	}
-  
-	struct dinode din;
-	bzero(&din, sizeof(din));
-	din.type = xshort(type);
-	din.nlink = xshort(1);
-	din.size = xint(0);
-
-	uint nb = balloc();
-	char buf[BSIZE];
-	bzero(buf, BSIZE);
-	
-	memcpy(buf, &din, sizeof(din));
-	bwrite(nb, buf);
-	imap[cur_inode] = nb;
-
-	return cur_inode++;
-}
-
-uint
-balloc(void)
-{
-	char zeroes[BSIZE];
-	bzero(zeroes, BSIZE);
-
-	uint bret = cur_block++;
-	bwrite(bret, zeroes);
-
-	// segment is full.
-	if (++seg_block == SEGDATABLOCKS) {
-		seg_block = 0;
-		sb.segment = cur_block - SEGDATABLOCKS;
-		sb.nsegs++;
-
-		seg_finish(sb.segment);
-
-		cur_block += SEGMETABLOCKS;
-	}
-
-	return bret;
-}
-
-void
-iappend(uint inum, void *xp, int n)
+void iappend(uint i, void * data, uint len)
 {
 	char out[BSIZE];
 
-	struct dinode din;
-	rinode(inum, &din);
+	struct dinode di;
+	iread(i, &di);
 
-	uint wr = din.size;
-	uint max = wr + n;
+	uint wr = di.size;
+	uint max = wr + len;
 	uint data_off = 0;
 
 	while (wr < max) {
-		uint n  = min(BSIZE - wr % BSIZE, max - wr);
-		uint db = data_block(din.addrs, wr);
+		uint len  = MIN(BSIZE - wr % BSIZE, max - wr);
+		uint db = data_block(di.addrs, wr);
 
 		bread(db, out);
-		memcpy(out + wr % BSIZE, xp + data_off, n);
+		memcpy(out + wr % BSIZE, data + data_off, len);
 		bwrite(db, out);
 		
-		wr += n;
-		data_off += n;
+		wr += len;
+		data_off += len;
 	}
 
-	din.size = xint(n);
+	di.size = max;
 
-	winode(inum, &din);
+	iwrite(i, &di);
 }

@@ -91,7 +91,7 @@ binit(void)
     b->prev = &bcache.head;
 	b->dev = -1;
 	b->flags = 0;
-    initsleeplock(&b->lock, "buffer");
+    //initsleeplock(&b->lock, "buffer");
     bcache.head.next->prev = b;
     bcache.head.next = b;
   }
@@ -106,7 +106,7 @@ binit(void)
 static struct buf*
 bget(uint dev, uint blockno)
 {
-	if (blockno == 0) panic("bget: invalid block");
+	//if (blockno == 0) panic("bget: invalid block");
 	
 	waitseg();
 	
@@ -226,8 +226,8 @@ bwrite(struct buf *b)
 void
 brelse(struct buf *b)
 {
-  if(!holdingsleep(&b->lock))
-    panic("brelse");
+  //if(!holdingsleep(&b->lock))
+    //panic("brelse");
 
   releasesleep(&b->lock);
 
